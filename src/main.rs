@@ -3,7 +3,7 @@ use chrono::{DateTime, Datelike, Duration, Local, Timelike, Weekday};
 
 use dotenv::dotenv;
 use poise::serenity_prelude as serenity;
-use ::serenity::all::{ChannelId, CreateScheduledEvent, EventHandler, GuildId, Message, Ready, ScheduledEvent, ScheduledEventType, Timestamp};
+use ::serenity::all::{ChannelId, CreateScheduledEvent, EventHandler, GetMessages, GuildId, Ready, ScheduledEvent, ScheduledEventType, Timestamp};
 use tracing::info;
 
 // use sqlx::{PgPool, Pool, Postgres};
@@ -30,37 +30,51 @@ impl EventHandler for Handler {
 
         tokio::spawn(async move {
             let http = Arc::clone(&ctx.http);
-            let mut old_msgs: Vec<Message> = Vec::new();
+            let mut eight_hour_msg_sent = false;
+            let mut one_hour_msg_sent = false;
+
             loop {
                 let http_clone = Arc::clone(&http);
                 // Get the current local time
                 let now = Local::now();
-
-                if now.weekday() == Weekday::Mon && (EVENT_HOUR - now.hour() == 8) {
-                    let msg = SESSIONS_CHANNEL_ID.say(http_clone.clone(), "Hey @everyone, schedules session today starts in 8 hours").await.expect("Failed to send reminder message");
-                    old_msgs.push(msg);
-                }
+                // Find the next Monday
+                let next_monday = {
+                    let mut days_ahead = (Weekday::Mon.num_days_from_monday() as i64
+                        - now.weekday().num_days_from_monday() as i64)
+                        % 7;
+                    if days_ahead <= 0 {
+                        days_ahead += 7; // move to next week if today is Monday or later
+                    }
+                    now + Duration::days(days_ahead)
+                };
                 
-                if now.weekday() == Weekday::Mon && (EVENT_HOUR - now.hour() == 1) {
-                    let msg = SESSIONS_CHANNEL_ID.say(http_clone.clone(), "Hey @everyone, schedules session today starts in 1 hour").await.expect("Failed to send reminder message");
-                    old_msgs.push(msg);
-                }
-
                 let scheduled_events = GUILD_ID.scheduled_events(http_clone.clone(), false).await.expect("Failed to get events");
                 let bible_events: Vec<&ScheduledEvent> = scheduled_events.iter().filter(|event| event.name.clone() == EVENT_NAME.to_string()).collect();
 
-                if now.weekday() == Weekday::Tue || bible_events.is_empty(){
-                    info!("Creatint event: {}", EVENT_NAME);
-                    // Find the next Monday
-                    let next_monday = {
-                        let mut days_ahead = (Weekday::Mon.num_days_from_monday() as i64
-                            - now.weekday().num_days_from_monday() as i64)
-                            % 7;
-                        if days_ahead <= 0 {
-                            days_ahead += 7; // move to next week if today is Monday or later
+                if now.weekday() == Weekday::Mon && (EVENT_HOUR - now.hour() == 8) && !bible_events.is_empty() && !eight_hour_msg_sent {
+                    let _msg = SESSIONS_CHANNEL_ID.say(http_clone.clone(), "Hey @everyone, schedules session today starts in 8 hours").await.expect("Failed to send reminder message");
+                    one_hour_msg_sent = true;
+                }
+                
+                if now.weekday() == Weekday::Mon && (EVENT_HOUR - now.hour() == 1) && !bible_events.is_empty() && !one_hour_msg_sent {
+                    let _msg = SESSIONS_CHANNEL_ID.say(http_clone.clone(), "Hey @everyone, schedules session today starts in 1 hour").await.expect("Failed to send reminder message");
+                    one_hour_msg_sent = true;
+                }
+
+                if now.weekday() == Weekday::Tue && !bible_events.is_empty() {
+                    for event in bible_events.iter() {
+                        if event.start_time.day() < next_monday.day() as u8 {
+                            if let Err(e) = GUILD_ID.delete_scheduled_event(http_clone.clone(), event.id).await {
+                                let _ = ADMIN_CHANNEL_ID.say(http_clone.clone(),format!("@Eugene there was a problem deleting the old event on the server. Please do it manually I guess :nerd: {}", e)).await;
+                            }
                         }
-                        now + Duration::days(days_ahead)
-                    };
+                    }
+                }
+
+                if bible_events.is_empty() {
+                    info!("Creating event: {}", EVENT_NAME);
+                    eight_hour_msg_sent = false;
+                    one_hour_msg_sent = false;
     
                     // Build 8:00 AM Monday start and 9:00 AM end (1 hour duration)
                     let start_time_local: DateTime<Local> =
@@ -82,7 +96,7 @@ impl EventHandler for Handler {
             
                     let event = match GUILD_ID.create_scheduled_event(http_clone.clone(), builder).await {
                         Ok(event) => {
-                            println!("✅ Created event: {}", event.name);
+                            info!("✅ Created event: {} on {}", event.name, event.start_time.date());
                             event
                         },
                         Err(why) => {
@@ -93,15 +107,17 @@ impl EventHandler for Handler {
 
                     let event_url = format!("https://discord.com/events/{}/{}", event.guild_id, event.id);
                     
-                    for msg in old_msgs.iter() {
+                    let channel_msgs = SESSIONS_CHANNEL_ID.messages(http_clone.clone(), GetMessages::new()).await.expect("Failed to retrieve messages from sessions channel");
+
+                    for msg in channel_msgs.iter() {
                         let _ = msg.delete(http_clone.clone()).await;
                     }
 
-                    let msg = SESSIONS_CHANNEL_ID.say(http_clone.clone(), format!("Hey @everyone, a new session has been scheduled. If you can join great, just click interested. \n{}", event_url).to_string()).await.unwrap();
-                    old_msgs.push(msg);
+                    SESSIONS_CHANNEL_ID.say(http_clone.clone(), format!("Hey @everyone, a new session has been scheduled. If you can join great, just click interested. \n{}", event_url).to_string()).await.unwrap();
                 }
 
                 thread::sleep(std::time::Duration::from_millis(60000));
+                // thread::sleep(std::time::Duration::from_millis(5000));
             }
         });
 
@@ -123,6 +139,7 @@ async fn age(
 #[tokio::main]
 async fn main() {
     dotenv().ok();
+    tracing_subscriber::fmt::init();
     let token = std::env::var("DISCORD_TOKEN").expect("missing DISCORD_TOKEN");
     //let db_url = std::env::var("DB_URL").expect("missing DB_URL");
     let intents =
